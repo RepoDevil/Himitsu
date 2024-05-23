@@ -1,0 +1,225 @@
+name: Tsubaki Build
+
+on:
+  workflow_dispatch:
+    inputs:
+      Experimental:
+        type: boolean
+        required: true
+        default: false
+
+permissions: 
+  actions: write
+  contents: write
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  rinse:
+    runs-on: ubuntu-latest
+    env:
+      CI: true
+    steps:
+
+    - name: Drop orphan tags
+      continue-on-error: true
+      uses: fabriziocacicia/delete-tags-without-release-action@v0.1.0
+      env:
+        GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+  wash:
+    needs: rinse
+    runs-on: ubuntu-latest
+    env:
+      CI: true
+
+    steps:
+    - name: Checkout repo
+      uses: actions/checkout@v4
+      with:
+        repository: RepoDevil/Himitsu
+        ref: himitsu
+        github-server-url: ${{ secrets.LOCALHOST_URL }}
+        token: ${{ secrets.LOCALHOST_TOKEN }}
+        fetch-depth: 0
+        submodules: recursive
+
+    - name: Download last SHA artifact
+      continue-on-error: true
+      uses: dawidd6/action-download-artifact@v6
+      with:
+        workflow: tsubaki.yml
+        name: last-sha
+        path: .
+
+    - name: Retrieve commit hash
+      run: |
+        GIT_HASH=$(git rev-parse --short HEAD)
+        echo "GIT_HASH=${GIT_HASH}" >> $GITHUB_ENV
+        GIT_SHA=$(git rev-parse HEAD)
+        echo "GIT_SHA=${GIT_SHA}" >> $GITHUB_ENV
+
+    - name: Logs commits since SHA
+      continue-on-error: true
+      run: |
+        if [ -f last_sha.txt ]; then
+          LAST_SHA=$(cat last_sha.txt)
+        else
+          # Fallback to first commit if no previous SHA available
+          LAST_SHA=$(git rev-list --max-parents=0 HEAD)
+        fi
+        # Verify the commit is valid
+        if [ "$(git cat-file -t $LAST_SHA)" != "commit" ]; then
+          LAST_SHA=$(git rev-list --max-parents=0 HEAD)
+        fi
+        echo "Commits since $LAST_SHA:"
+        COMMIT_LOGS=$(git log $LAST_SHA..HEAD --pretty=format:"● %s ~%an")
+        echo "$COMMIT_LOGS" > commit_log.txt
+        # URL-encode the newline characters for GitHub Actions
+        COMMIT_LOGS="${COMMIT_LOGS//'%'/'%25'}"
+        COMMIT_LOGS="${COMMIT_LOGS//$'\n'/'%0A'}"
+        COMMIT_LOGS="${COMMIT_LOGS//$'\r'/'%0D'}"
+        echo "COMMIT_LOG=${COMMIT_LOGS}" >> $GITHUB_ENV
+        echo "$COMMIT_LOGS"
+      shell: /usr/bin/bash -e {0}
+      env:
+        CI: true
+
+    - name: Write current SHA to file
+      if: ${{ github.event.inputs.Experimental }} == false
+      continue-on-error: true
+      run: echo ${{ env.GIT_SHA }} > last_sha.txt
+
+    - name: Download server.aar
+      shell: bash
+      run: |
+        if [ ! -d app/libs ]; then
+          mkdir app/libs
+        fi
+        curl -H "Authorization: Token ${{ secrets.TORRSERVER_TOKEN }}" \
+        -H 'Accept: application/vnd.github.v3.raw' \
+        -o "app/libs/server.aar" \
+        -L "${{ secrets.TORRSERVER_URL }}/server.aar"
+
+    - name: Download server-sources.jar
+      shell: bash
+      run: |
+        curl -H "Authorization: Token ${{ secrets.TORRSERVER_TOKEN }}" \
+        -H 'Accept: application/vnd.github.v3.raw' \
+        -o "app/libs/server-sources.jar" \
+        -L "${{ secrets.TORRSERVER_URL }}/server-sources.jar"
+
+    - name: Setup JDK 17
+      uses: actions/setup-java@v4
+      with:
+        distribution: 'temurin'
+        java-version: 17
+        cache: gradle
+
+    - name: Decode Keystore File
+      run: echo "${{ secrets.KEYSTORE_FILE }}" | base64 -d > $GITHUB_WORKSPACE/key.keystore
+
+    - uses: burrunan/gradle-cache-action@v1
+      name: Build Release Gradle
+      with:
+        job-id: Release
+        # Specifies arguments for Gradle execution
+        arguments: |
+          --configure-on-demand
+          assembleGoogleMatagi
+          -Pandroid.injected.signing.store.file=${{ github.workspace }}/key.keystore
+          -Pandroid.injected.signing.store.password=${{ secrets.KEYSTORE_PASSWORD }}
+          -Pandroid.injected.signing.key.alias=${{ secrets.KEY_ALIAS }}
+          -Pandroid.injected.signing.key.password=${{ secrets.KEY_PASSWORD }}
+        # Gradle version to use for execution:
+        #   wrapper (default), current, rc, nightly, release-nightly, or
+        #   versions like 6.6 (see https://services.gradle.org/versions/all)
+        gradle-version: wrapper
+        # Properties are passed as -Pname=value
+        properties: |
+          org.gradle.unsafe.configuration-cache=true
+
+    - name: Upload SHA artifact
+      continue-on-error: true
+      uses: actions/upload-artifact@v4
+      with:
+        name: last-sha
+        path: last_sha.txt
+
+    - name: Purge past workflows
+      uses: Mattraks/delete-workflow-runs@v2
+      with:
+        token: ${{ secrets.GITHUB_TOKEN }}
+        repository: ${{ github.repository }}
+        retain_days: 1
+        keep_minimum_runs: 1
+
+    - uses: 8bitDream/action-github-releases@v1.0.0
+      with:
+        repo_token: "${{ secrets.GITHUB_TOKEN }}"
+        automatic_release_tag: ${{ env.GIT_HASH }}
+        prerelease: ${{ github.event.inputs.Experimental }}
+        title: Himitsu ${{ env.GIT_HASH }}
+        files: |
+          app/build/outputs/apk/google/matagi/Himitsu-${{ env.GIT_HASH }}-google-universal-matagi.apk
+          app/build/outputs/apk/google/matagi/Himitsu-${{ env.GIT_HASH }}-google-arm64-v8a-matagi.apk
+          app/build/outputs/apk/google/matagi/Himitsu-${{ env.GIT_HASH }}-google-armeabi-v7a-matagi.apk
+          app/build/outputs/apk/google/matagi/Himitsu-${{ env.GIT_HASH }}-google-x86_64-matagi.apk
+          app/build/outputs/apk/google/matagi/Himitsu-${{ env.GIT_HASH }}-google-x86-matagi.apk
+
+    - name: Publish release notes
+      continue-on-error: true
+      uses: softprops/action-gh-release@v2.0.8
+      with:
+        tag_name: ${{ env.GIT_HASH }}
+        name: Himitsu ${{ env.GIT_HASH }}
+        append_body: true
+        body_path: commit_log.txt
+        draft: false
+        prerelease: ${{ github.event.inputs.Experimental }}
+      env:
+        GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+    - name: Discord webhook notification
+      if: ${{ github.event.inputs.Experimental }} == false
+      shell: bash
+      run: |
+        commit_messages=$(echo "$COMMIT_LOG" | sed 's/%0A/\n/g; s/^/\n/')
+        #  Truncate commit messages if they are too long
+        max_length=1900 # Adjust this value as needed
+        if [ ${#commit_messages} -gt $max_length ]; then
+          commit_messages="${commit_messages:0:$max_length}... (truncated)"
+        fi
+        contentbody=$( jq -nc --arg msg "Himitsu Shirase **${{ env.GIT_HASH }}**" --arg commits "$commit_messages" '{"content": ($msg + "\n" + $commits)}' )
+        curl -F "payload_json=${contentbody}" ${{ secrets.DISCORD_WEBHOOK }}
+      env:
+        COMMIT_LOG: ${{ env.COMMIT_LOG }}
+        VERSION: ${{ env.VERSION }}
+
+    - name: Upload packages to Discord
+      if: ${{ github.event.inputs.Experimental }} == false
+      uses: sinshutu/upload-to-discord@master
+      env:
+        DISCORD_WEBHOOK: ${{ secrets.DISCORD_WEBHOOK }}
+      with:
+        args: |
+          app/build/outputs/apk/google/matagi/Himitsu-${{ env.GIT_HASH }}-google-arm64-v8a-matagi.apk
+          app/build/outputs/apk/google/matagi/Himitsu-${{ env.GIT_HASH }}-google-armeabi-v7a-matagi.apk
+          app/build/outputs/apk/google/matagi/Himitsu-${{ env.GIT_HASH }}-google-x86_64-matagi.apk
+          app/build/outputs/apk/google/matagi/Himitsu-${{ env.GIT_HASH }}-google-x86-matagi.apk
+
+  dry:
+    needs: wash
+    runs-on: ubuntu-latest
+    env:
+      CI: true
+    steps:
+
+    - name: Purge build cache
+      continue-on-error: true
+      uses: MyAlbum/purge-cache@v2
+      with:
+        max-age: 86400 # 1 day, default: 7 days since last use
+        token: ${{ secrets.GITHUB_TOKEN }}
