@@ -141,7 +141,7 @@ jobs:
 
     - name: Upload SHA artifact
       continue-on-error: true
-      uses: actions/upload-artifact@v2
+      uses: actions/upload-artifact@v4
       with:
         name: last-sha
         path: last_sha.txt
